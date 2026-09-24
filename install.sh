@@ -238,7 +238,7 @@ ANALYZE address, food, shop, office, zensus, level_default;
 COMMIT;
 PACH_REFRESH
 cat > $ROOT/model.py << 'PACH_MODEL'
-"""Same rules as src/lib/pacht-model.ts. Imbiss turnover only. No colour if workplaces are missing."""
+"""Same rules as src/lib/pacht-model.ts. Index is local people-per-outlet over the Imbiss-stock median."""
 
 SHOP_OUT = 40
 SHOP_RADIUS_M = 150
@@ -258,7 +258,20 @@ def workplaces(floor_m2, skipped):
         return None, None
     return floor_m2 / M2_SPARSE, floor_m2 / M2_DENSE
 
-def judge(residents, workplaces_low, workplaces_high, outlets, city_residents, city_work_low, city_work_high, city_outlets, rent_month, plate, m2):
+def people_per_outlet(residents, workplaces, outlets):
+    return (residents + workplaces) / max(outlets, 1)
+
+def median(values):
+    xs = sorted(values)
+    n = len(xs)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2:
+        return xs[mid]
+    return (xs[mid - 1] + xs[mid]) / 2
+
+def judge(residents, workplaces_low, workplaces_high, outlets, median_low, median_high, rent_month, plate, m2):
     missing = []
     if residents is None:
         missing.append("residents")
@@ -266,19 +279,17 @@ def judge(residents, workplaces_low, workplaces_high, outlets, city_residents, c
         missing.append("workplaces")
     if outlets is None:
         missing.append("outlets")
-    if None in (city_residents, city_work_low, city_work_high, city_outlets) or not city_outlets:
-        missing.append("citywide")
+    if median_low is None or median_high is None or median_low <= 0 or median_high <= 0:
+        missing.append("median")
     if missing:
         return {"status": "nicht gemessen", "missing": missing}
 
-    def index_for(work, city_work):
-        local = (residents + work) / max(outlets, 1)
-        city = (city_residents + city_work) / city_outlets
-        raw = local / city
+    def index_for(work, median_people):
+        raw = people_per_outlet(residents, work, outlets) / median_people
         return min(INDEX_MAX, max(INDEX_MIN, raw))
 
-    index_low = index_for(workplaces_low, city_work_low)
-    index_high = index_for(workplaces_high, city_work_high)
+    index_low = index_for(workplaces_low, median_low)
+    index_high = index_for(workplaces_high, median_high)
     lo, hi = sorted((index_low, index_high))
     sales_low = IMBISS_MONTH * lo
     sales_high = IMBISS_MONTH * hi
@@ -304,8 +315,98 @@ def judge(residents, workplaces_low, workplaces_high, outlets, city_residents, c
         "platesNeeded": plates_needed,
         "coverage": {"low": cov_low, "high": cov_high},
         "tone": tone,
+        "on_floor": lo <= INDEX_MIN or hi <= INDEX_MIN,
+        "on_ceiling": lo >= INDEX_MAX or hi >= INDEX_MAX,
     }
 PACH_MODEL
+cat > $ROOT/stock.py << 'PACH_STOCK'
+"""People-per-outlet around every Frankfurt fast_food, then the median of those values."""
+
+import subprocess
+
+from model import RADIUS_M, SHOP_RADIUS_M, median, people_per_outlet, workplaces
+
+SCOPE_SQL = f"""
+SELECT COALESCE(zr.residents, 0)::text || '|' ||
+       COALESCE(fr.n, 0)::text || '|' ||
+       COALESCE(oc.skipped, 0)::text || '|' ||
+       COALESCE(oc.floor, 0)::text || '|' ||
+       COALESCE(sh.n, 0)::text
+FROM food f
+LEFT JOIN LATERAL (
+  SELECT SUM(residents) AS residents
+  FROM zensus z
+  WHERE ST_DWithin(z.geom::geography, f.geom::geography, {RADIUS_M})
+) zr ON true
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS n
+  FROM food g
+  WHERE g.kind = 'fast_food'
+    AND ST_DWithin(g.geom::geography, f.geom::geography, {RADIUS_M})
+) fr ON true
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) FILTER (WHERE floor_m2 IS NULL) AS skipped,
+         SUM(floor_m2) AS floor
+  FROM office o
+  WHERE ST_DWithin(o.geom::geography, f.geom::geography, {RADIUS_M})
+) oc ON true
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS n
+  FROM shop s
+  WHERE ST_DWithin(s.geom::geography, f.geom::geography, {SHOP_RADIUS_M})
+) sh ON true
+WHERE f.kind = 'fast_food' AND f.in_frankfurt
+"""
+
+def psql(sql):
+    out = subprocess.check_output(
+        [
+            "docker", "exec", "-e", "PGPASSWORD=pacht",
+            "-e", "PGOPTIONS=-c statement_timeout=0",
+            "pachtgrenze-db",
+            "psql", "-U", "pacht", "-d", "pacht", "-v", "ON_ERROR_STOP=1", "-tA", "-c", sql,
+        ],
+        text=True,
+    )
+    return out.strip()
+
+def load_scopes():
+    text = psql(SCOPE_SQL)
+    rows = []
+    if not text:
+        return rows
+    for line in text.splitlines():
+        residents, outlets, skipped, floor, shops = line.split("|")
+        low, high = workplaces(float(floor), int(skipped))
+        rows.append({
+            "residents": float(residents),
+            "outlets": int(outlets),
+            "shops": int(shops),
+            "work_low": low,
+            "work_high": high,
+            "low": None if low is None else people_per_outlet(float(residents), low, int(outlets)),
+            "high": None if high is None else people_per_outlet(float(residents), high, int(outlets)),
+        })
+    return rows
+
+def stock_medians(rows):
+    lows = [row["low"] for row in rows if row["low"] is not None]
+    highs = [row["high"] for row in rows if row["high"] is not None]
+    return median(lows), median(highs), len(rows), len(lows)
+
+def store_medians(median_low, median_high, n, used):
+    psql(
+        "CREATE TABLE IF NOT EXISTS stock_norm ("
+        "id int PRIMARY KEY, n int NOT NULL, used int NOT NULL, "
+        "median_low double precision NOT NULL, median_high double precision NOT NULL)"
+    )
+    psql(
+        "INSERT INTO stock_norm (id, n, used, median_low, median_high) VALUES ("
+        f"1, {int(n)}, {int(used)}, {float(median_low)}, {float(median_high)}) "
+        "ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n, used = EXCLUDED.used, "
+        "median_low = EXCLUDED.median_low, median_high = EXCLUDED.median_high"
+    )
+PACH_STOCK
 cat > $ROOT/selftest.py << 'PACH_SELFTEST'
 """Berger 148 or Waldschul 8 must return a colour or a named out-of-scope reason. nicht gemessen is not a pass."""
 
@@ -315,13 +416,14 @@ import sys
 import time
 
 from model import RADIUS_M, SHOP_OUT, SHOP_RADIUS_M, judge, workplaces
+from stock import psql as stock_psql
 
 FIXED = [
-    ("zeil-22", "22 Zeil", "60313"),
-    ("berger-148", "148 Berger", "60385"),
-    ("waldschul-8", "8 Waldschul", "65933"),
+    ("zeil-22", "22 Zeil", "60313", False),
+    ("berger-148", "148 Berger", "60385", False),
+    ("waldschul-9", "9 Waldschul", "65933", True),
 ]
-GATES = {"berger-148", "waldschul-8"}
+GATES = {"berger-148", "waldschul-9"}
 # IHK low band, Gewerbemarktbericht 2025, times the labelled 80 m² assumption. Not a listing.
 PROBE_RENT = 800
 PROBE_M2 = 80
@@ -362,12 +464,17 @@ def workplace_block(where):
         "workplace_label": label,
     }
 
-def one(number_street, postcode):
+def one(number_street, postcode, prefix, median_low, median_high):
+    if prefix:
+        street_sql = f"split_part(label, ',', 1) LIKE '{number_street}%'"
+    else:
+        street_sql = (
+            f"(split_part(label, ',', 1) = '{number_street}' "
+            f"OR split_part(label, ',', 1) LIKE '{number_street} %')"
+        )
     label = psql(
         "SELECT label || '|' || ST_Y(geom)::text || '|' || ST_X(geom)::text FROM address "
-        f"WHERE (split_part(label, ',', 1) = '{number_street}' "
-        f"OR split_part(label, ',', 1) LIKE '{number_street} %') "
-        f"AND label LIKE '%{postcode}%' "
+        f"WHERE {street_sql} AND label LIKE '%{postcode}%' "
         "ORDER BY char_length(label) LIMIT 1"
     )
     if not label:
@@ -396,11 +503,8 @@ def one(number_street, postcode):
         "SELECT COUNT(*) FROM food WHERE kind = 'fast_food' AND "
         f"ST_DWithin(geom::geography, ST_GeogFromText('{point}'), {RADIUS_M})"
     ))
-    city_people_raw = psql("SELECT SUM(residents) FROM zensus")
-    city_people = None if city_people_raw == "" else float(city_people_raw)
-    city_food = int(psql("SELECT COUNT(*) FROM food WHERE kind = 'fast_food' AND in_frankfurt"))
     judged = judge(
-        residents, low, high, outlets, city_people, city_low, city_high, city_food,
+        residents, low, high, outlets, median_low, median_high,
         PROBE_RENT, PROBE_PLATE, PROBE_M2,
     )
     judged["label"] = name
@@ -425,11 +529,18 @@ def main():
         "FROM level_default WHERE scope = 'Frankfurt'"
     ))
     print("STADTTEIL_MEDIANS", psql("SELECT COUNT(*) FROM level_default WHERE scope LIKE 'Stadtteil %'"))
+    raw_median = stock_psql("SELECT median_low::text || '|' || median_high::text FROM stock_norm WHERE id = 1")
+    if not raw_median:
+        print("SELFTEST FAIL")
+        print("median nicht gemessen")
+        return 1
+    median_low, median_high = (float(part) for part in raw_median.split("|"))
+    print(f"MEDIAN_PEOPLE_PER_OUTLET {median_low:.4f} {median_high:.4f}")
     gate = False
-    for key, street, postcode in FIXED:
+    for key, street, postcode, prefix in FIXED:
         started = time.perf_counter()
         try:
-            row = one(street, postcode)
+            row = one(street, postcode, prefix, median_low, median_high)
         except subprocess.CalledProcessError as exc:
             row = {"status": "fail", "error": "psql"}
         elapsed = time.perf_counter() - started
@@ -442,202 +553,126 @@ def main():
         print("SELFTEST PASS")
         return 0
     print("SELFTEST FAIL")
-    print("need Berger 148 or Waldschul 8 colour or named out-of-scope. nicht gemessen is not a pass")
+    print("need Berger 148 or Waldschul 9 colour or named out-of-scope. nicht gemessen is not a pass")
     return 1
 
 if __name__ == "__main__":
     sys.exit(main())
 PACH_SELFTEST
 cat > $ROOT/backtest.py << 'PACH_BACKTEST'
-"""20 fast_food nodes present in OSM at both dates, via ohsome. PASS only if at least 15 of 20 get a colour."""
+"""Current Frankfurt Imbiss stock. No ohsome. Survivor history is a later Geofabrik snapshot, not this run."""
 
-import json
-import subprocess
 import sys
-import urllib.parse
-import urllib.request
 
-from model import RADIUS_M, SHOP_OUT, SHOP_RADIUS_M, judge, workplaces
+from model import INDEX_MAX, INDEX_MIN, SHOP_OUT, judge
+from stock import load_scopes, stock_medians, store_medians
 
-# IHK Frankfurt, Gewerbemarktbericht Ausgabe 2025, Einzelhandel 1-b und Nebenlage.
-# Bornheim, Berger Straße: von 10,00 bis 21,50 EUR/m²/Monat. Schwerpunkt dort nicht angegeben.
-# https://www.frankfurt-main.ihk.de/blueprint/servlet/resource/blob/6750400/e6f23a9813c1ecaf6f27022e61e9b789/gewerbemarktbericht-2025-data.pdf
 RENT_SOURCE = "IHK Frankfurt Gewerbemarktbericht 2025, Berger Straße, 1-b und Nebenlage, von 10,00 bis 21,50 EUR/m2/Monat"
 RENTS = (10.0, 21.5)
 ASSUMED_M2 = 80
 PLATE = 7.5
-EARLY = "2021-09-24"
-LATE = "2026-09-24"
-NEED_COLOUR = 15
 
-def psql(sql):
-    out = subprocess.check_output(
-        [
-            "docker", "exec", "-e", "PGPASSWORD=pacht",
-            "-e", "PGOPTIONS=-c statement_timeout=2500", "pachtgrenze-db",
-            "psql", "-U", "pacht", "-d", "pacht", "-v", "ON_ERROR_STOP=1", "-tA", "-c", sql,
-        ],
-        text=True,
-    )
-    return out.strip()
+def pct(values, p):
+    xs = sorted(values)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
-def ohsome(when):
-    query = urllib.parse.urlencode(
-        {
-            "bboxes": "8.472,50.015,8.800,50.227",
-            "filter": "amenity=fast_food",
-            "time": when,
-            "properties": "tags",
-        }
+def colour_row(row, median_low, median_high, rent_m2):
+    if row["shops"] >= SHOP_OUT:
+        return "out", None
+    judged = judge(
+        row["residents"], row["work_low"], row["work_high"], row["outlets"],
+        median_low, median_high, rent_m2 * ASSUMED_M2, PLATE, ASSUMED_M2,
     )
-    request = urllib.request.Request(
-        "https://api.ohsome.org/v1/elements/centroid?" + query,
-        headers={"User-Agent": "pachtgrenze-check/0.1 (https://pachtgrenze.de)"},
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return json.load(response)
-
-def features(body):
-    found = {}
-    for feature in body.get("features", []):
-        props = feature.get("properties") or {}
-        osm_id = str(props.get("@osmId") or feature.get("id") or "")
-        if not osm_id:
-            continue
-        coords = (feature.get("geometry") or {}).get("coordinates") or [None, None]
-        found[osm_id] = {"lon": coords[0], "lat": coords[1], "name": (props.get("name") or "")}
-    return found
-
-def levels_at(where):
-    skipped, defaulted, count, floor = psql(
-        "SELECT COUNT(*) FILTER (WHERE floor_m2 IS NULL) || '|' || "
-        "COUNT(*) FILTER (WHERE levels_defaulted) || '|' || "
-        "COUNT(*) || '|' || COALESCE(SUM(floor_m2), 0) "
-        f"FROM office WHERE {where}"
-    ).split("|")
-    low, high = workplaces(float(floor), int(skipped))
-    count_n = int(count)
-    defaulted_n = int(defaulted)
-    share = None if count_n == 0 else round(defaulted_n / count_n, 4)
-    label = "Schätzung" if defaulted_n > 0 else ("gemessen" if int(skipped) == 0 else None)
-    return low, high, share, label
-
-def colour_at(lat, lon, rent_m2):
-    point = f"SRID=4326;POINT({lon} {lat})"
-    near = f"ST_DWithin(geom::geography, ST_GeogFromText('{point}'), {{radius}})"
-    shops = int(psql(f"SELECT COUNT(*) FROM shop WHERE {near.format(radius=SHOP_RADIUS_M)}"))
-    low, high, share, label = levels_at(near.format(radius=RADIUS_M))
-    city_low, city_high, city_share, _ = levels_at("in_frankfurt")
-    meta = {"defaulted_share": share, "city_defaulted_share": city_share, "workplace_label": label}
-    if shops >= SHOP_OUT:
-        return "out", {**meta, "reason": "Einkaufsstraße"}
-    residents_raw = psql(
-        "SELECT SUM(residents) FROM zensus WHERE "
-        f"ST_DWithin(geom::geography, ST_GeogFromText('{point}'), {RADIUS_M})"
-    )
-    outlets = int(psql(
-        "SELECT COUNT(*) FROM food WHERE kind = 'fast_food' AND "
-        f"ST_DWithin(geom::geography, ST_GeogFromText('{point}'), {RADIUS_M})"
-    ))
-    city_people_raw = psql("SELECT SUM(residents) FROM zensus")
-    city_food = int(psql("SELECT COUNT(*) FROM food WHERE kind = 'fast_food' AND in_frankfurt"))
-    row = judge(
-        None if residents_raw == "" else float(residents_raw),
-        low,
-        high,
-        outlets,
-        None if city_people_raw == "" else float(city_people_raw),
-        city_low,
-        city_high,
-        city_food,
-        rent_m2 * ASSUMED_M2,
-        PLATE,
-        ASSUMED_M2,
-    )
-    row.update(meta)
-    if row["status"] != "colour":
-        return "nicht gemessen", row
-    tone = {"bad": "red", "warn": "amber", "ok": "green"}[row["tone"]]
-    row["tone_word"] = tone
-    return tone, row
+    if judged["status"] != "colour":
+        return "nicht gemessen", judged
+    tone = {"bad": "red", "warn": "amber", "ok": "green"}[judged["tone"]]
+    judged["tone_word"] = tone
+    return tone, judged
 
 def main():
     print("RENT", RENT_SOURCE)
     print(f"ASSUMED_M2 {ASSUMED_M2}")
     print(f"PLATE_EUR {PLATE} not from a menu")
-    try:
-        early = features(ohsome(EARLY))
-        late = features(ohsome(LATE))
-    except Exception as exc:
+    print("NORM median people-per-outlet of existing Frankfurt fast_food, radius 400, both m2 bands")
+    rows = load_scopes()
+    median_low, median_high, n, used = stock_medians(rows)
+    print(f"STOCK_N {n}")
+    print(f"MEDIAN_N {used}")
+    if median_low is None or median_high is None:
         print("BACKTEST FAIL")
-        print("history nicht gemessen")
-        print(type(exc).__name__)
+        print("median nicht gemessen")
         return 1
-    both = sorted(set(early) & set(late))
-    print(f"HISTORY_BOTH {len(both)} {EARLY} {LATE}")
-    if len(both) < 20:
-        print("BACKTEST FAIL")
-        print(f"need 20 have {len(both)}")
-        return 1
-    chosen = []
-    for key in both[:20]:
-        row = dict(late[key])
-        row["id"] = key
-        chosen.append(row)
+    store_medians(median_low, median_high, n, used)
+    print(f"MEDIAN_PEOPLE_PER_OUTLET {median_low:.4f} {median_high:.4f}")
     best = None
-    coloured_ok = True
+    failed = False
     for rent in RENTS:
         counts = {"green": 0, "amber": 0, "red": 0, "out": 0, "nicht gemessen": 0}
-        for shop in chosen:
-            if shop["lat"] is None:
-                counts["nicht gemessen"] += 1
-                continue
-            tone, detail = colour_at(shop["lat"], shop["lon"], rent)
+        indexes_low = []
+        indexes_high = []
+        floor = 0
+        ceiling = 0
+        for row in rows:
+            tone, detail = colour_row(row, median_low, median_high, rent)
             counts[tone] += 1
-            if tone == "green" and best is None and detail is not None and detail.get("status") == "colour":
-                best = {"id": shop["id"], "rent_m2": rent, "detail": detail}
-        coloured = counts["green"] + counts["amber"] + counts["red"]
+            if detail is None or detail.get("status") != "colour":
+                continue
+            indexes_low.append(detail["locationIndex"]["low"])
+            indexes_high.append(detail["locationIndex"]["high"])
+            if detail["on_floor"]:
+                floor += 1
+            if detail["on_ceiling"]:
+                ceiling += 1
+            if tone == "green" and best is None:
+                best = {"rent_m2": rent, "detail": detail}
         print(
             f"RENT_EUR_M2 {rent} green {counts['green']} amber {counts['amber']} "
             f"red {counts['red']} out {counts['out']} nicht_gemessen {counts['nicht gemessen']}"
         )
-        if coloured and counts["red"] > counts["green"] + counts["amber"]:
-            print("MODEL FAIL parameter RENT_SHARE 0.10 times national Imbiss month, index capped at 2")
-        if coloured < NEED_COLOUR:
-            coloured_ok = False
-            print(f"coloured {coloured} need {NEED_COLOUR}")
-    if best is not None and coloured_ok:
-        path = "/var/lib/pachtgrenze/sample-report.txt"
+        print(
+            f"INDEX_LOW p10 {pct(indexes_low, 0.10):.4f} p50 {pct(indexes_low, 0.50):.4f} "
+            f"p90 {pct(indexes_low, 0.90):.4f}"
+        )
+        print(
+            f"INDEX_HIGH p10 {pct(indexes_high, 0.10):.4f} p50 {pct(indexes_high, 0.50):.4f} "
+            f"p90 {pct(indexes_high, 0.90):.4f}"
+        )
+        print(f"FLOOR {floor}")
+        print(f"CEILING {ceiling}")
+        if rent == 10.0 and counts["red"] > n * 0.5:
+            failed = True
+            print(f"STOCK FAIL red {counts['red']} of {n} at 10 EUR/m2")
+    if failed:
+        print("SAMPLE not published")
+        print("BACKTEST FAIL")
+        return 1
+    if best is not None:
         detail = best["detail"]
+        path = "/var/lib/pachtgrenze/sample-report.txt"
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(
-                "\n".join(
-                    [
-                        f"id {best['id']}",
-                        f"tone {detail['tone_word']}",
-                        f"concept {detail['concept']}",
-                        f"wz {detail['wz']}",
-                        f"radius_m {detail['radiusM']}",
-                        f"rent_eur_m2 {best['rent_m2']}",
-                        f"index {detail['locationIndex']['low']:.4f} {detail['locationIndex']['high']:.4f}",
-                        f"plates {detail['plates']['low']:.2f} {detail['plates']['high']:.2f}",
-                        f"plates_needed {detail['platesNeeded']:.2f}",
-                        f"coverage {detail['coverage']['low']:.4f} {detail['coverage']['high']:.4f}",
-                        f"workplace_label {detail.get('workplace_label')}",
-                        f"defaulted_share {detail.get('defaulted_share')}",
-                        RENT_SOURCE,
-                        f"assumed_m2 {ASSUMED_M2}",
-                        f"plate_eur {PLATE}",
-                    ]
-                )
-                + "\n"
+                "\n".join([
+                    "tone green",
+                    f"concept {detail['concept']}",
+                    f"wz {detail['wz']}",
+                    f"radius_m {detail['radiusM']}",
+                    f"rent_eur_m2 {best['rent_m2']}",
+                    f"index {detail['locationIndex']['low']:.4f} {detail['locationIndex']['high']:.4f}",
+                    f"coverage {detail['coverage']['low']:.4f} {detail['coverage']['high']:.4f}",
+                    f"median_people {median_low:.4f} {median_high:.4f}",
+                    RENT_SOURCE,
+                    f"assumed_m2 {ASSUMED_M2}",
+                    f"plate_eur {PLATE}",
+                ]) + "\n"
             )
         print("SAMPLE", path)
     else:
         print("SAMPLE not published")
-    if not coloured_ok:
-        print("BACKTEST FAIL")
-        return 1
     print("BACKTEST PASS")
     return 0
 
@@ -682,7 +717,7 @@ if __name__ == "__main__":
     ThreadingHTTPServer(("0.0.0.0", 8090), Handler).serve_forever()
 PACH_APP
 
-chmod 644 "$ROOT/docker-compose.yml" "$ROOT/Caddyfile" "$ROOT/init.sql" "$ROOT/refresh.sql" "$ROOT/model.py" "$ROOT/selftest.py" "$ROOT/backtest.py" "$ROOT/app/Dockerfile" "$ROOT/app/app.py"
+chmod 644 "$ROOT/docker-compose.yml" "$ROOT/Caddyfile" "$ROOT/init.sql" "$ROOT/refresh.sql" "$ROOT/model.py" "$ROOT/stock.py" "$ROOT/selftest.py" "$ROOT/backtest.py" "$ROOT/app/Dockerfile" "$ROOT/app/app.py"
 if grep -E '0\.0\.0\.0:8080|- ["'\'']*8080:' "$ROOT/docker-compose.yml"; then
   echo "refusing host port 8080"
   exit 1
